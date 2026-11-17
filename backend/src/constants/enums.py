@@ -1,3 +1,7 @@
 ROLES=('admin','analyst','viewer')
 STATES=('queued','running','done','failed')
 ZONES=('冷藏','冷冻','常温对照')
+IDENTITY_STATES=('unmerged','pending','merged','split')
+MERGE_KINDS=('merge','split')
+REC_STATUSES=('draft','approved','review')
+MEASURE_FIELDS=('exposure','excursions','loss')

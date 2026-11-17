@@ -21,9 +21,9 @@ app.include_router(router)
 @app.get('/health')
 def health():
  from sqlalchemy import text
- import redis
+ from src.services import queue
  with engine.connect() as c:c.execute(text('SELECT 1'))
- redis.Redis.from_url(os.environ['REDIS_URL']).ping()
+ queue.ping()
  return {'status':'ok'}
 @app.exception_handler(Exception)
 async def errors(request:Request,exc:Exception):

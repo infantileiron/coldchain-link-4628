@@ -1,14 +1,16 @@
 import os,json
-import redis
 from fastapi import APIRouter,Depends,HTTPException,Response
 from sqlalchemy.exc import IntegrityError
 from src.config.database import db
-from src.models.entities import User,Shipment,Sample,Study,Recommendation,Audit
-from src.schemas.business import Login,ShipmentInput,SampleInput,StudyInput,RecommendationInput
+from src.models.entities import User,Shipment,Sample,Study,Recommendation,Audit,SampleIdentity,IdentityMember,IdentityCorrection
+from src.schemas.business import Login,ShipmentInput,SampleInput,StudyInput,RecommendationInput,MergeInput,SplitInput
 from src.middlewares.auth import current,editor,admin
 from src.utils.security import verify,token
-from src.services.business import audit,dump
-from src.controllers.business import ensure_shipment,ensure_study,study_rows
+from src.services.business import dump
+from src.services import queue
+from src.services.identity import audit,ensure_unmerged_identity,merge_preview,merge_identities,split_identity,identity_catalog,now_iso,MEASURE_FIELDS
+from src.controllers.business import ensure_shipment,ensure_study,study_rows,ensure_identity_for_sample,lock_sample
+import redis
 router=APIRouter()
 @router.post('/auth/login')
 def login(data:Login,s=Depends(db)):
@@ -27,9 +29,24 @@ def ship(data:ShipmentInput,u=Depends(editor),s=Depends(db)):
  audit(s,u,'创建班次 '+r.code);return dump(r)
 @router.get('/samples')
 def samples(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(Sample).all()]
+def _sync_identity(s,sample):
+ member=s.query(IdentityMember).filter(IdentityMember.sample_id==sample.id,IdentityMember.left_version.is_(None)).first()
+ if not member:
+  ensure_unmerged_identity(s,sample);return
+ ident=s.get(SampleIdentity,member.identity_id)
+ if ident.status not in ('unmerged','split'):return
+ ship=s.get(Shipment,sample.shipment_id)
+ ident.zone=ship.zone if ship else ident.zone
+ ident.display_code=sample.code
+ for f in MEASURE_FIELDS:setattr(ident,f,getattr(sample,f))
+ ident.field_sources={f:sample.id for f in MEASURE_FIELDS if getattr(sample,f) is not None}
+ ident.updated=now_iso()
 @router.post('/samples')
 def sample(data:SampleInput,u=Depends(editor),s=Depends(db)):
  ensure_shipment(s,data.shipment_id);r=Sample(**data.model_dump());s.add(r)
+ try:s.flush()
+ except IntegrityError:s.rollback();raise HTTPException(409,'样本编号重复')
+ _sync_identity(s,r)
  try:s.commit()
  except IntegrityError:s.rollback();raise HTTPException(409,'样本编号重复')
  audit(s,u,'录入样本 '+r.code);return dump(r)
@@ -37,11 +54,13 @@ def sample(data:SampleInput,u=Depends(editor),s=Depends(db)):
 def studies(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(Study).order_by(Study.id.desc()).all()]
 @router.post('/studies')
 def study(data:StudyInput,u=Depends(editor),s=Depends(db)):
- rows=study_rows(s,data.zone);r=Study(**data.model_dump(),result={'snapshot':rows});s.add(r);s.commit()
- try:redis.Redis.from_url(os.environ['REDIS_URL']).rpush('studies',r.id)
+ rows=study_rows(s,data.zone)
+ if not rows:raise HTTPException(409,'该温区暂无可计算样本')
+ r=Study(**data.model_dump(),result={'snapshot':rows});s.add(r);s.commit()
+ try:queue.queue_study(r.id)
  except redis.RedisError:
   r.state='failed';r.error='队列暂不可用，请重新创建研究';s.commit();raise HTTPException(503,r.error)
- audit(s,u,'提交研究 '+str(r.id));return dump(r)
+ audit(s,u,'提交研究 '+str(r.id)+f'（身份去重后 {len(rows)} 个实物）');return dump(r)
 @router.get('/studies/{i}')
 def detail(i:int,u=Depends(current),s=Depends(db)):return dump(ensure_study(s,i))
 @router.get('/studies/{i}/export')
@@ -59,10 +78,10 @@ def rec(data:RecommendationInput,u=Depends(editor),s=Depends(db)):
 def approve(i:int,u=Depends(admin),s=Depends(db)):
  r=s.get(Recommendation,i)
  if not r:raise HTTPException(404,'建议不存在')
+ if r.status=='review':raise HTTPException(409,'待复核建议需复核后重新签核')
  r.status='approved';s.commit();audit(s,u,'签核建议 '+str(i));return dump(r)
 @router.get('/audits')
 def audits(u=Depends(admin),s=Depends(db)):return [dump(r) for r in s.query(Audit).order_by(Audit.id.desc()).limit(100)]
-
 @router.put('/shipments/{i}')
 def edit_ship(i:int,data:ShipmentInput,u=Depends(editor),s=Depends(db)):
  row=s.get(Shipment,i)
@@ -73,10 +92,24 @@ def edit_ship(i:int,data:ShipmentInput,u=Depends(editor),s=Depends(db)):
  audit(s,u,'修改班次 '+str(i));return dump(row)
 @router.put('/samples/{i}')
 def edit_sample(i:int,data:SampleInput,u=Depends(editor),s=Depends(db)):
- row=s.get(Sample,i)
+ row=lock_sample(s,i)
  if not row:raise HTTPException(404,'样本不存在')
  ensure_shipment(s,data.shipment_id)
+ ensure_identity_for_sample(s,row)
  for k,v in data.model_dump().items():setattr(row,k,v)
+ _sync_identity(s,row)
  try:s.commit()
  except IntegrityError:s.rollback();raise HTTPException(409,'样本编号重复')
  audit(s,u,'修改样本 '+str(i));return dump(row)
+@router.get('/identities')
+def identities(u=Depends(current),s=Depends(db)):return identity_catalog(s)
+@router.post('/identities/merge-preview')
+def preview(data:MergeInput,u=Depends(editor),s=Depends(db)):return merge_preview(s,data.sample_ids)
+@router.post('/identities/merge')
+def merge(data:MergeInput,u=Depends(editor),s=Depends(db)):return merge_identities(s,u,data)
+@router.post('/identities/split')
+def split(data:SplitInput,u=Depends(editor),s=Depends(db)):return split_identity(s,u,data)
+@router.get('/identities/{i}/corrections')
+def corrections(i:int,u=Depends(current),s=Depends(db)):
+ if not s.get(SampleIdentity,i):raise HTTPException(404,'身份不存在')
+ return [dump(c) for c in s.query(IdentityCorrection).filter_by(identity_id=i).order_by(IdentityCorrection.id).all()]

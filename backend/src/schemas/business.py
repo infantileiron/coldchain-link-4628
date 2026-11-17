@@ -10,3 +10,14 @@ class StudyInput(BaseModel):
  name:str=Field(min_length=1,max_length=100);zone:Literal['冷藏','冷冻','常温对照'];feature:Literal['exposure','excursions']='exposure'
 class RecommendationInput(BaseModel):
  study_id:int;note:str=Field(min_length=10,max_length=2000);owner:str=Field(min_length=1,max_length=60)
+class MergeChoice(BaseModel):
+ sample_id:int
+class MergeInput(BaseModel):
+ request_id:str=Field(min_length=8,max_length=60)
+ sample_ids:list[int]=Field(min_length=2)
+ choices:dict[str,MergeChoice]={}
+class SplitInput(BaseModel):
+ request_id:str=Field(min_length=8,max_length=60)
+ identity_id:int
+ base_version:int
+ retain_sample_ids:list[int]=Field(min_length=1)

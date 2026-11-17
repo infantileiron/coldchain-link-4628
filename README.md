@@ -52,6 +52,21 @@ Python3.11 / FastAPI / SQLAlchemy / SciPy / PyMySQL / PyJWT；MySQL8.0；Redis7�
 
 本地开发：安装 backend/requirements.lock（真实运行环境完整依赖锁定；requirements.txt 为直接依赖）；启动本地 MySQL/Redis，设置 DATABASE_URL/REDIS_URL/JWT_SECRET 后 `uvicorn src.main:app --reload`。前端可由 Nginx 提供，代理 `/api/` 去除前缀转发给后端。
 
+## 样本身份归并（防止同一实物换编号夸大关联）
+
+同一实物在不同班次被编成多个样本号会重复计入配对、夸大相关性。系统为每个实物维护一个身份档案（`sample_identities`），样本与身份为多对一的在组关系（`identity_members` 保留入组/离组履历）。
+
+- 状态机：独立身份 `unmerged` → 待核对 `pending`（前端预览态）→ 已合并 `merged` → 已拆回 `split`。
+- 归并前先 `POST /identities/merge-preview` 查看温区与逐字段冲突；冲突字段必须在 `choices` 里逐项指定来源样本，跨温区一律拒绝合并（409）。
+- 确认归并 `POST /identities/merge`：按所选来源重算代表值，把代表值同步更正到组内全部原记录，每次字段级更正写入 `identity_corrections`（原值、新值、来源、请求编号、版本），原记录本身保留不删除。
+- 新研究 `POST /studies` 以身份为单位采样，每个实物只计一次；快照冻结 `identity_id`、`field_sources`、配对数与代表值，创建时不读取"半组"（预览未落库不影响计算）。之后的归并/拆回不改变旧研究结果，旧研究原样可读。
+- 身份变化后，引用过受影响身份的已签核建议自动转 `review`（待复核），需人工复核后重新签核；拆回不会自动恢复签核。
+- 误合并可用 `POST /identities/split` 拆回：携带 `base_version`，版本过期拒绝（409）；拆回为离组样本重建独立身份，合并期间的更正原样保留。
+- 并发与幂等：归并/拆回对身份行加行锁并校验单调 `version`；`request_id` 落 `merge_requests` 唯一台账，同次重试返回首次响应、不重复变更，失败事务回滚恢复。
+- 已合并身份的原记录禁止直接 PUT 修改，须先拆回；独立身份样本编辑会同步其身份代表值与字段来源。
+- 前端「样本身份」页展示 待核对/已合并/已拆回 标签、配对数、字段来源，以及原值→新值的逐项更正对照。
+
+
 环境变量：COMPOSE_PROJECT_NAME（容器前缀）、FRONTEND_PORT/BACKEND_PORT/DB_PORT（映射）、DB_PASSWORD（演示数据库密码）、JWT_SECRET、SEED_DEMO。仅内部服务接触 Redis，不映射宿主端口。编辑班次与样本 API 支持 PUT；UI 当前以新增和浏览为主，无批量 CSV 导入、删除、分页或邮件通知。Google Fonts 需联网，无法联网则浏览器回退 serif/sans-serif。证据和测试在批次根 test-artifacts/gb-3102，不写入源码。
 
 License: MIT。

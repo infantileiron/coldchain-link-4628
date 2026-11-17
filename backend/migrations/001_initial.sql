@@ -1,2 +1,14 @@
 -- Initial schema is created through SQLAlchemy Base.metadata.create_all.
 -- Natural keys: users.email, shipments.code, samples.code; unique constraints enforce idempotency.
+--
+-- 样本身份归并扩展表（由 SQLAlchemy create_all 一并创建）：
+-- sample_identities   实物身份组：状态 unmerged/pending/merged/split、单调递增 version、
+--                     代表测量值与 field_sources（逐字段来源样本 id）。
+-- identity_members    成员履历：sample_id 普通索引；active_sample_id 为生成列
+--                     （left_version IS NULL 时等于 sample_id，否则 NULL），带唯一约束，
+--                     保证同一时刻一个样本只属于一个在组身份，历史离组行可共存。
+-- identity_corrections 逐项更正留痕：字段、原值、新值、来源编号、请求编号、发生时版本。
+-- merge_requests      归并/拆回幂等台账：request_id 唯一，重试返回首次响应，不重复变更。
+--
+-- 并发：归并/拆回以 SELECT ... FOR UPDATE 锁定相关身份行并校验 version；
+-- 过期 base_version、跨温区、同组重复配对返回 409，事务回滚恢复，调用方可刷新后重试。
